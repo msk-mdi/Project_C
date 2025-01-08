@@ -37,6 +37,8 @@
 #include <openssl/rsa.h>
 #include <openssl/pem.h>
 #include <openssl/evp.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 /*******************************************************************************
  *                           CONSTANTES ET MACROS
@@ -1134,32 +1136,30 @@ static void run_client(const char *username, const char *host, int port)
  ******************************************************************************/
 int main(int argc, char **argv)
 {
-    if (argc < 2) {
-        fprintf(stderr, "Usage:\n");
-        fprintf(stderr, "  %s server <port>\n", argv[0]);
-        fprintf(stderr, "  %s admin <host> <port>\n", argv[0]);
-        fprintf(stderr, "  %s client <username> <host> <port>\n", argv[0]);
-        exit(EXIT_FAILURE);
-    }
-
-    OpenSSL_add_all_algorithms();
+    // Initialisation moderne d'OpenSSL
+    OPENSSL_init_ssl(0, NULL);
+    SSL_load_error_strings(); // Non nécessaire dans OpenSSL 3.x mais pas nuisible pour les versions antérieures
     ERR_load_crypto_strings();
 
+    // --- Génération ou chargement de la clé RSA admin ---
     g_adminPrivateKey = generate_rsa_keypair(2048);
 
+    // Extraire la clé publique admin
     BIO *pubBio = BIO_new(BIO_s_mem());
     PEM_write_bio_RSA_PUBKEY(pubBio, g_adminPrivateKey);
     g_adminPublicKey = RSA_new();
     PEM_read_bio_RSA_PUBKEY(pubBio, &g_adminPublicKey, NULL, NULL);
     BIO_free(pubBio);
 
+    // --- Enregistrer des utilisateurs ---
     server_add_user("alice", "alicepass");
-    server_add_user("bob",   "bobpass");
+    server_add_user("bob", "bobpass");
+    server_add_user("admin", "adminpass");
 
     RSA *aliceKey = generate_rsa_keypair(1024);
     UserInfo *alice = server_find_user("alice");
     if (alice) alice->publicKey = aliceKey;
-    // Bob
+
     RSA *bobKey = generate_rsa_keypair(1024);
     UserInfo *bob = server_find_user("bob");
     if (bob) bob->publicKey = bobKey;
@@ -1177,9 +1177,6 @@ int main(int argc, char **argv)
             fprintf(stderr, "Usage: %s admin <host> <port>\n", argv[0]);
             exit(EXIT_FAILURE);
         }
-        // Dans cette démo, on ne fait pas de connexion. On appelle un menu local.
-        // Les paramètres <host> <port> sont ignorés dans cet exemple, mais on
-        // les garde pour coller à la signature demandée.
         run_admin(argv[2], atoi(argv[3]));
     }
     else if (strcmp(argv[1], "client") == 0) {
@@ -1194,14 +1191,10 @@ int main(int argc, char **argv)
         exit(EXIT_FAILURE);
     }
 
-    // Libération
     if (g_adminPrivateKey) RSA_free(g_adminPrivateKey);
     if (g_adminPublicKey)  RSA_free(g_adminPublicKey);
-    // Libérer les clés publiques de nos users
     for (int i = 0; i < g_userCount; i++) {
-        if (g_users[i].publicKey) {
-            RSA_free(g_users[i].publicKey);
-        }
+        if (g_users[i].publicKey) RSA_free(g_users[i].publicKey);
     }
 
     EVP_cleanup();
