@@ -656,7 +656,7 @@ static void* server_client_thread(void *arg)
 static void run_server(int port)
 {
     // Initialisation OpenSSL
-    OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
+    OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
     OpenSSL_add_all_algorithms();
 
     int serverSock = socket(AF_INET, SOCK_STREAM, 0);
@@ -782,7 +782,7 @@ static void run_admin(const char *host, int port)
 static void run_client(const char *username, const char *host, int port)
 {
     // Initialisation OpenSSL
-    OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
+    OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
     OpenSSL_add_all_algorithms();
 
     // 1) Connexion
