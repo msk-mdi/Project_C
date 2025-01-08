@@ -714,13 +714,122 @@ static void run_server(int port)
 
 static void run_admin(const char *host, int port)
 {
-    // Ici, pour simplifier, on ne fait pas un "canal administrateur" complet
-    // où on récupère la liste des messages. On suppose que l'admin a accès
-    // direct en mémoire (même process que le serveur) ou via un "canal local".
-    // On se contentera d'un petit menu local.
-    // => En production, on ferait un vrai client Admin + Diffie-Hellman, etc.
+    // Initialisation OpenSSL
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
 
-    printf("=== Mode Administrateur (local) ===\n");
+    // 1) Connexion au serveur
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("socket");
+        exit(EXIT_FAILURE);
+    }
+    struct sockaddr_in servAddr;
+    memset(&servAddr, 0, sizeof(servAddr));
+    servAddr.sin_family = AF_INET;
+    servAddr.sin_port = htons(port);
+    if (inet_pton(AF_INET, host, &servAddr.sin_addr) <= 0) {
+        perror("inet_pton");
+        exit(EXIT_FAILURE);
+    }
+    if (connect(sock, (struct sockaddr*)&servAddr, sizeof(servAddr)) < 0) {
+        perror("connect");
+        exit(EXIT_FAILURE);
+    }
+    printf("Connecté au serveur %s:%d\n", host, port);
+
+    // --- 2) ECHANGE DIFFIE-HELLMAN ---
+    // (Similaire à `run_client`)
+    int recvSize;
+    recv(sock, &recvSize, sizeof(recvSize), 0);
+    recvSize = ntohl(recvSize);
+    unsigned char *pBuf = (unsigned char*)malloc(recvSize);
+    recv(sock, pBuf, recvSize, 0);
+    BIGNUM *p = BN_bin2bn(pBuf, recvSize, NULL);
+
+    recv(sock, &recvSize, sizeof(recvSize), 0);
+    recvSize = ntohl(recvSize);
+    unsigned char *gBuf = (unsigned char*)malloc(recvSize);
+    recv(sock, gBuf, recvSize, 0);
+    BIGNUM *g = BN_bin2bn(gBuf, recvSize, NULL);
+
+    recv(sock, &recvSize, sizeof(recvSize), 0);
+    recvSize = ntohl(recvSize);
+    unsigned char *pubSBuf = (unsigned char*)malloc(recvSize);
+    recv(sock, pubSBuf, recvSize, 0);
+    BIGNUM *pubKeyServer = BN_bin2bn(pubSBuf, recvSize, NULL);
+
+    free(pBuf); free(gBuf); free(pubSBuf);
+
+    DH *dhClient = DH_new();
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    dhClient->p = BN_dup(p);
+    dhClient->g = BN_dup(g);
+#else
+    DH_set0_pqg(dhClient, BN_dup(p), NULL, BN_dup(g));
+#endif
+    BN_free(p);
+    BN_free(g);
+
+    if (!DH_generate_key(dhClient))
+        handle_openssl_error("DH_generate_key(dhClient)");
+    const BIGNUM *pubKeyClient = NULL;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    pubKeyClient = dhClient->pub_key;
+#else
+    DH_get0_key(dhClient, &pubKeyClient, NULL);
+#endif
+
+    int pubKeySize = BN_num_bytes(pubKeyClient);
+    int netSize = htonl(pubKeySize);
+    send(sock, &netSize, sizeof(netSize), 0);
+    unsigned char *pubC = (unsigned char*)malloc(pubKeySize);
+    BN_bn2bin(pubKeyClient, pubC);
+    send(sock, pubC, pubKeySize, 0);
+    free(pubC);
+
+    unsigned char sharedKey[SHA256_DIGEST_LENGTH];
+    memset(sharedKey, 0, sizeof(sharedKey));
+    compute_shared_key(dhClient, pubKeyServer, sharedKey);
+
+    BN_free(pubKeyServer);
+    DH_free(dhClient);
+
+    // --- 3) AUTHENTIFICATION ---
+    printf("Mot de passe administrateur: ");
+    fflush(stdout);
+    char pwd[128];
+    if (!fgets(pwd, sizeof(pwd), stdin)) {
+        close(sock);
+        return;
+    }
+    pwd[strcspn(pwd, "\n")] = 0;
+    unsigned char hashPwd[PASSWORD_HASH_SIZE];
+    sha256_hash(pwd, hashPwd);
+
+    unsigned char clearAuth[PASSWORD_HASH_SIZE];
+    memcpy(clearAuth, hashPwd, PASSWORD_HASH_SIZE);
+
+    unsigned char encAuth[BUFFER_SIZE];
+    int encAuthLen = aes_encrypt(clearAuth, sizeof(clearAuth), sharedKey, encAuth);
+    send(sock, encAuth, encAuthLen, 0);
+
+    unsigned char respBuf[64];
+    int r = recv(sock, respBuf, 64, 0);
+    if (r <= 0) {
+        close(sock);
+        return;
+    }
+    unsigned char decResp[64];
+    int decRespLen = aes_decrypt(respBuf, r, sharedKey, decResp);
+    if (decRespLen <= 0 || strcmp((char*)decResp, "AUTH_OK") != 0) {
+        printf("Authentification échouée.\n");
+        close(sock);
+        return;
+    }
+    printf("Authentification réussie.\n");
+
+    // --- 4) Menu interactif ---
     while (1) {
         printf("\n--- Menu Administrateur ---\n");
         printf("1) Lister messages/fichiers\n");
@@ -728,44 +837,48 @@ static void run_admin(const char *host, int port)
         printf("3) Quitter\n");
         printf("Choix : ");
         fflush(stdout);
+
         char buff[32];
         if (!fgets(buff, sizeof(buff), stdin)) continue;
         int choix = atoi(buff);
+
         if (choix == 1) {
-            for (int i = 0; i < g_messageCount; i++) {
-                printf("[%d] %s -> %s | %s | valid=%d\n",
-                       i,
-                       g_messages[i].sender,
-                       g_messages[i].receiver,
-                       g_messages[i].isFile ? "FICHIER" : "MESSAGE",
-                       g_messages[i].validated);
+            // Demande de liste des messages/fichiers
+            int reqType = htonl(REQUEST_ADMIN_APPROVE_FILE);
+            send(sock, &reqType, sizeof(reqType), 0);
+
+            // Recevoir la liste
+            unsigned char encList[BUFFER_SIZE];
+            r = recv(sock, encList, BUFFER_SIZE, 0);
+            if (r <= 0) continue;
+
+            unsigned char clearList[BUFFER_SIZE];
+            int decLen = aes_decrypt(encList, r, sharedKey, clearList);
+            if (decLen > 0) {
+                printf("Messages/Fichiers :\n%s\n", (char*)clearList);
             }
         }
         else if (choix == 2) {
+            // Valider un fichier
             printf("Entrez l'index du fichier à valider: ");
             if (!fgets(buff, sizeof(buff), stdin)) continue;
             int idx = atoi(buff);
-            if (idx < 0 || idx >= g_messageCount) {
-                printf("Index invalide.\n");
-                continue;
-            }
-            // On récupère la clé publique de B
-            UserInfo *receiverUser = server_find_user(g_messages[idx].receiver);
-            if (!receiverUser || !receiverUser->publicKey) {
-                printf("Le destinataire n'a pas de clé publique chargée!\n");
-                continue;
-            }
-            // Validation
-            server_approve_file(idx, receiverUser->publicKey);
+
+            unsigned char clearRequest[sizeof(int)];
+            memcpy(clearRequest, &idx, sizeof(int));
+
+            unsigned char encRequest[BUFFER_SIZE];
+            int encLen = aes_encrypt(clearRequest, sizeof(clearRequest), sharedKey, encRequest);
+            send(sock, encRequest, encLen, 0);
         }
         else if (choix == 3) {
-            break;
+            close(sock);
+            return;
         }
         else {
             printf("Choix invalide.\n");
         }
     }
-    printf("Fermeture mode Admin.\n");
 }
 
 /*******************************************************************************
@@ -1016,12 +1129,8 @@ static void run_client(const char *username, const char *host, int port)
  *   - admin <host> <port>
  *   - client <username> <host> <port>
  *
- *  Pour tout simplifier, on précharge dans le serveur des utilisateurs
- *  "alice", "bob", etc., avec mot de passe en clair transformé en hash
- *  => En production : stockage DB, config, ...
- *
- *  On génère (ou charge) la clé RSA de l'administrateur en dur.
- *
+ * user: alice          user: bob
+ * mdp: alicepass       mdp: bobpass
  ******************************************************************************/
 int main(int argc, char **argv)
 {
@@ -1036,24 +1145,17 @@ int main(int argc, char **argv)
     OpenSSL_add_all_algorithms();
     ERR_load_crypto_strings();
 
-    // --- Génération ou chargement de la clé RSA admin ---
-    // Pour la démo, on génère à la volée (2048 bits)
     g_adminPrivateKey = generate_rsa_keypair(2048);
 
-    // Extraire la clé publique admin
     BIO *pubBio = BIO_new(BIO_s_mem());
     PEM_write_bio_RSA_PUBKEY(pubBio, g_adminPrivateKey);
     g_adminPublicKey = RSA_new();
     PEM_read_bio_RSA_PUBKEY(pubBio, &g_adminPublicKey, NULL, NULL);
     BIO_free(pubBio);
 
-    // --- Enregistrer des utilisateurs sur le "serveur" ---
-    // Ici en dur : user "alice" + user "bob" + ...
     server_add_user("alice", "alicepass");
     server_add_user("bob",   "bobpass");
-    // En production, on chargerait leur clé publique RSA depuis des PEM.
-    // ICI, pour la démo, on génère aussi leur clé en dur.
-    // Alice
+
     RSA *aliceKey = generate_rsa_keypair(1024);
     UserInfo *alice = server_find_user("alice");
     if (alice) alice->publicKey = aliceKey;
@@ -1062,7 +1164,6 @@ int main(int argc, char **argv)
     UserInfo *bob = server_find_user("bob");
     if (bob) bob->publicKey = bobKey;
 
-    // Selon le mode :
     if (strcmp(argv[1], "server") == 0) {
         if (argc != 3) {
             fprintf(stderr, "Usage: %s server <port>\n", argv[0]);
